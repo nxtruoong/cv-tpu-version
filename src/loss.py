@@ -15,8 +15,8 @@ from .config import NT_XENT_TEMPERATURE
 
 def _xla_world_size() -> int:
     try:
-        import torch_xla.core.xla_model as xm
-        return xm.xrt_world_size()
+        import torch_xla.runtime as xr
+        return xr.world_size()
     except Exception:
         return 1
 

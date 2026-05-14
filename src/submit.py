@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
+import torch_xla
 import torch_xla.core.xla_model as xm
 
 from .augmentation import build_tta_transforms
@@ -83,7 +84,7 @@ def write_submission(
 
 def run_submit(args) -> None:
     set_seed()
-    device = xm.xla_device()
+    device = torch_xla.device()
 
     test_paths = list_test_images()
     bundles = args.bundles

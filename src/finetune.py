@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm
 
+import torch_xla
 import torch_xla.core.xla_model as xm
 
 from .augmentation import build_finetune_train_transform, build_eval_transform
@@ -78,7 +79,7 @@ def train_one_epoch(model, loader, optim, loss_fn, device) -> float:
 
 def run_finetune(args) -> dict:
     set_seed()
-    device = xm.xla_device()
+    device = torch_xla.device()
 
     df = load_driver_table()
     folds = build_group_kfold(df)

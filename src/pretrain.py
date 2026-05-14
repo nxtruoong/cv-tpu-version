@@ -27,6 +27,7 @@ from tqdm import tqdm
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
+import torch_xla.runtime as xr
 
 from .augmentation import build_pretrain_transform, ContrastiveViewGenerator, \
     build_pretrain_eval_transform
@@ -51,7 +52,7 @@ def _unwrap(m: nn.Module) -> nn.Module:
 
 
 def is_main() -> bool:
-    return xm.get_ordinal() == 0
+    return xr.global_ordinal() == 0
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, history, out_dir) -> None:
@@ -97,9 +98,9 @@ def build_probe_loaders(batch_size: int, num_workers: int) -> tuple:
 
 def run_pretrain(args) -> None:
     set_seed()
-    device = xm.xla_device()
-    world_size = xm.xrt_world_size()
-    rank = xm.get_ordinal()
+    device = torch_xla.device()
+    world_size = xr.world_size()
+    rank = xr.global_ordinal()
 
     view_gen = ContrastiveViewGenerator(build_pretrain_transform())
     use_cache = (Path(PRETRAIN_CACHE_PATH).exists()
