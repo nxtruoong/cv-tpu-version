@@ -1,4 +1,9 @@
-"""SSL diagnostics: linear probe + alignment/uniformity tracking."""
+"""SSL diagnostics: linear probe + alignment/uniformity tracking.
+
+XLA notes: extract_features / linear_probe call .cpu() on tensors — that
+triggers an implicit xm.mark_step. We also call xm.mark_step explicitly to keep
+graph traces small inside the probe training loop.
+"""
 from typing import Dict, List
 import numpy as np
 import torch
@@ -7,6 +12,14 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .config import NUM_CLASSES
+
+
+def _mark_step():
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+    except Exception:
+        pass
 
 
 @torch.no_grad()
@@ -20,6 +33,7 @@ def extract_features(
         h = backbone(x)
         feats.append(h.cpu())
         labels.append(y)
+        _mark_step()
     return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
 
@@ -60,6 +74,7 @@ def linear_probe(
             optim.zero_grad()
             loss.backward()
             optim.step()
+        _mark_step()
 
     head.eval()
     val_feats = val_feats.to(device)
@@ -93,6 +108,7 @@ def sample_alignment_uniformity(
         v2 = v2.to(device, non_blocking=True)
         z1 = simclr_model(v1)
         z2 = simclr_model(v2)
+        _mark_step()
         stats = alignment_uniformity(z1, z2)
         aligns.append(stats["alignment"])
         uniforms.append(stats["uniformity"])

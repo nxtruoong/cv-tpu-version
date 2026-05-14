@@ -1,43 +1,39 @@
-"""NT-Xent loss with DDP-aware all_gather.
+"""NT-Xent loss with XLA-aware all_gather.
 
-Critical detail: must preserve local-rank gradient. Naive `dist.all_gather` returns
-tensors detached from autograd for non-local ranks; we replace the local slot with
-the in-graph tensor so backward propagates correctly.
+XLA path: xm.all_gather preserves gradients natively across replicas — no need
+to splice the local slot back in (unlike NCCL where all_gather is detached).
 
-For single-GPU use, gather is a no-op and this reduces to standard NT-Xent.
+For single-device use, gather is a no-op and this reduces to standard NT-Xent.
 """
-from typing import Optional
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from .config import NT_XENT_TEMPERATURE
 
 
-def _is_dist() -> bool:
-    return dist.is_available() and dist.is_initialized()
+def _xla_world_size() -> int:
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xrt_world_size()
+    except Exception:
+        return 1
 
 
-def _all_gather_with_grad(t: torch.Tensor) -> torch.Tensor:
-    """all_gather across ranks while preserving gradient for local rank's slot."""
-    if not _is_dist():
-        return t
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    gathered = [torch.zeros_like(t) for _ in range(world_size)]
-    dist.all_gather(gathered, t)
-    gathered[rank] = t  # critical: keep local tensor in graph
-    return torch.cat(gathered, dim=0)
+def _all_gather_xla(t: torch.Tensor) -> torch.Tensor:
+    """XLA all_gather; preserves grad for local rank."""
+    import torch_xla.core.xla_model as xm
+    return xm.all_gather(t, dim=0)
 
 
 class NTXentLoss(nn.Module):
-    """SimCLR NT-Xent loss with DDP support.
+    """SimCLR NT-Xent loss with XLA multi-core support.
 
     Args:
         temperature: Softmax temperature τ.
-        gather_distributed: If True, gather z from all ranks before computing loss
-            so anchors see negatives from all GPUs (true batch).
+        gather_distributed: If True, gather z from all replicas before computing
+            loss so anchors see negatives from all cores (true batch).
     """
 
     def __init__(
@@ -51,20 +47,18 @@ class NTXentLoss(nn.Module):
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         """z1, z2: L2-normalized projections of shape (B, D)."""
-        if self.gather_distributed and _is_dist():
-            z1 = _all_gather_with_grad(z1)
-            z2 = _all_gather_with_grad(z2)
+        if self.gather_distributed and _xla_world_size() > 1:
+            z1 = _all_gather_xla(z1)
+            z2 = _all_gather_xla(z2)
 
         batch = z1.size(0)
         z = torch.cat([z1, z2], dim=0)  # (2B, D)
 
         sim = torch.matmul(z, z.t()) / self.temperature  # (2B, 2B)
 
-        # Mask out self-similarity on the diagonal
         mask_self = torch.eye(2 * batch, dtype=torch.bool, device=z.device)
         sim.masked_fill_(mask_self, float("-inf"))
 
-        # Positive pair targets: for i in [0..B), positive is i+B; for i in [B..2B), positive is i-B
         targets = torch.arange(2 * batch, device=z.device)
         targets = (targets + batch) % (2 * batch)
 

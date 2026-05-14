@@ -1,5 +1,9 @@
 """Fine-tune loop. Stage 1: freeze backbone, train classifier.
-Stage 2: unfreeze, discriminative LR. Used for all 3 conditions."""
+Stage 2: unfreeze, discriminative LR. Used for all 3 conditions.
+
+Runs on XLA single device (one TPU core is plenty for this small dataset).
+bf16 native via XLA_USE_BF16=1 — no torch.amp, no GradScaler.
+"""
 import argparse
 import json
 from pathlib import Path
@@ -9,9 +13,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
 from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm
+
+import torch_xla.core.xla_model as xm
 
 from .augmentation import build_finetune_train_transform, build_eval_transform
 from .config import (
@@ -46,6 +51,7 @@ def evaluate(model: nn.Module, loader, device, loss_fn) -> dict:
         pred = logits.argmax(dim=1)
         correct += (pred == y).sum().item()
         total += x.size(0)
+        xm.mark_step()
     return {
         "val_loss": total_loss / total,
         "val_log_loss": ll_sum / total,
@@ -53,20 +59,18 @@ def evaluate(model: nn.Module, loader, device, loss_fn) -> dict:
     }
 
 
-def train_one_epoch(model, loader, optim, loss_fn, scaler, device, amp: bool) -> float:
+def train_one_epoch(model, loader, optim, loss_fn, device) -> float:
     model.train()
     running = 0.0
     n = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        with autocast("cuda", enabled=amp):
-            logits = model(x)
-            loss = loss_fn(logits, y)
+        logits = model(x)
+        loss = loss_fn(logits, y)
         optim.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.step(optim)
-        scaler.update()
+        loss.backward()
+        xm.optimizer_step(optim, barrier=True)
         running += loss.item() * x.size(0)
         n += x.size(0)
     return running / n
@@ -74,7 +78,7 @@ def train_one_epoch(model, loader, optim, loss_fn, scaler, device, amp: bool) ->
 
 def run_finetune(args) -> dict:
     set_seed()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = xm.xla_device()
 
     df = load_driver_table()
     folds = build_group_kfold(df)
@@ -98,7 +102,6 @@ def run_finetune(args) -> dict:
 
     model = build_classifier_for_condition(args.condition, args.simclr_ckpt).to(device)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=FINETUNE_LABEL_SMOOTHING)
-    scaler = GradScaler("cuda", enabled=args.amp)
 
     # ---- Stage 1: freeze backbone, train classifier ----
     freeze_backbone(model)
@@ -110,8 +113,7 @@ def run_finetune(args) -> dict:
           f"({FINETUNE_STAGE1_EPOCHS} epochs)")
     history = []
     for epoch in range(FINETUNE_STAGE1_EPOCHS):
-        tl = train_one_epoch(model, train_loader, optim1, loss_fn, scaler,
-                             device, args.amp)
+        tl = train_one_epoch(model, train_loader, optim1, loss_fn, device)
         m = evaluate(model, val_loader, device, loss_fn)
         m.update({"stage": 1, "epoch": epoch, "train_loss": tl})
         history.append(m)
@@ -135,8 +137,7 @@ def run_finetune(args) -> dict:
     patience = 0
     for epoch in range(FINETUNE_STAGE2_EPOCHS):
         scheduler2.step(epoch)
-        tl = train_one_epoch(model, train_loader, optim2, loss_fn, scaler,
-                             device, args.amp)
+        tl = train_one_epoch(model, train_loader, optim2, loss_fn, device)
         m = evaluate(model, val_loader, device, loss_fn)
         m.update({"stage": 2, "epoch": epoch, "train_loss": tl})
         history.append(m)
@@ -160,15 +161,15 @@ def run_finetune(args) -> dict:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    torch.save({
-        "model_state_dict": model.state_dict(),
+    xm.save({
+        "model_state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "class_names": CLASS_NAMES,
         "preprocessing": {"resize": 224, "mean": IMAGENET_MEAN, "std": IMAGENET_STD},
         "condition": args.condition,
         "fold": args.fold,
         "best_val_log_loss": best_ll,
         "history": history,
-    }, bundle_path)
+    }, str(bundle_path))
     print(f"Saved: {bundle_path} (best val log loss: {best_ll:.4f})")
 
     with open(out_dir / f"history_{args.condition}_fold{args.fold}.json", "w") as f:
@@ -186,7 +187,6 @@ def parse_args() -> argparse.Namespace:
                    help="Required for B_simclr.")
     p.add_argument("--batch-size", type=int, default=FINETUNE_BATCH_SIZE)
     p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--output-dir", type=str, default=None)
     return p.parse_args()
 

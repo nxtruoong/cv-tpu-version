@@ -4,10 +4,13 @@ Set WINNER_CONDITION based on kaggle_finetune.py headline results.
 Outputs 5 bundles + averaged-probability submission.
 """
 import sys
+import os
 import argparse
 from pathlib import Path
 
 sys.path.insert(0, "/kaggle/working/CV")
+os.environ.setdefault("PJRT_DEVICE", "TPU")
+os.environ.setdefault("XLA_USE_BF16", "1")
 
 from src.finetune import run_finetune
 from src.submit import run_submit
@@ -24,7 +27,6 @@ def make_args(fold: int):
         simclr_ckpt=SIMCLR_CKPT if WINNER_CONDITION == "B_simclr" else None,
         batch_size=128,
         num_workers=4,
-        amp=True,
         output_dir=OUTPUT_DIR,
     )
 

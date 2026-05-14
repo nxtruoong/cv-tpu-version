@@ -1,27 +1,24 @@
-"""SimCLR pretraining on Kaggle T4 x2.
+"""SimCLR pretraining on Kaggle TPU VM (v3-8 / v5e-8).
 
-Paste this into a Kaggle notebook with Accelerator = GPU T4 x2.
+Paste this into a Kaggle notebook with Accelerator = TPU.
 
 Strategy:
-- DDP via torch.multiprocessing.spawn (notebook-friendly alternative to torchrun).
-- 100 epochs total, batch 768, LR sqrt-scaled, rect 160x120 (W x H).
-- torch.compile(max-autotune) + FP16 AMP + channels_last. First epoch slower
-  due to one-time autotune (1-3 min); steady-state ~3-4 min/epoch with cache.
+- PyTorch XLA via xmp.spawn (8 TPU cores).
+- bf16 native — no AMP, no GradScaler, no torch.compile.
+- Cross-replica gradient sync handled by xm.optimizer_step.
+- 100 epochs total, global batch 768 (96 per core), LR sqrt-scaled.
 - REQUIRED: run `python -m src.pretrain_cache` first to build the uint8
-  memmap (eliminates JPEG decode bottleneck on Kaggle 4 vCPU). pretrain.py
-  auto-detects the cache and switches dataset accordingly.
-- num_workers=2 per rank (4 total) to match Kaggle 4 vCPU — avoid oversubscribe.
-- Target: <10h wallclock single session. No multi-day resume needed.
-- Save every 10. Diagnostic every 10 (linear probe + align/uniform).
+  memmap. pretrain.py auto-detects the cache.
+- num_workers=4 per core (32 total) — Kaggle TPU VM has plenty of CPUs.
+- Save every 10. Diagnostic every 10 (linear probe + align/uniform), rank0 only.
 - Resume from previous checkpoint by setting RESUME below (optional).
 
 After session ends, download `simclr_resnet18_latest.pth` and upload as a
 Kaggle Dataset so fine-tune notebook can attach it as input.
 
-NOTE: ddp_worker MUST be defined in src.pretrain (importable module), not in this
-notebook script. torch.multiprocessing.spawn pickles by qualified name and child
-processes re-import __main__ — functions defined inside exec() in a notebook are
-not picklable for spawn children.
+NOTE: _mp_fn MUST be defined in src.pretrain (importable module), not in this
+notebook script. xmp.spawn pickles by qualified name and child processes
+re-import — functions defined inside exec() in a notebook are not picklable.
 """
 import sys
 import os
@@ -29,14 +26,17 @@ import argparse
 
 REPO_ROOT = "/kaggle/working/CV"
 sys.path.insert(0, REPO_ROOT)
-# Child spawn processes inherit env but NOT sys.path. Set PYTHONPATH so
-# `from src.pretrain import ddp_worker` resolves inside spawned workers.
 os.environ["PYTHONPATH"] = REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", "")
 
-import torch
-import torch.multiprocessing as mp
+# XLA runtime selection. PJRT is the modern XLA runtime — required for v4/v5e.
+os.environ.setdefault("PJRT_DEVICE", "TPU")
+# bf16 by default on TPU. XLA_USE_BF16 downcasts all float32 ops to bf16 on
+# device (parameters stay fp32 on host). Safe for SimCLR + AdamW.
+os.environ.setdefault("XLA_USE_BF16", "1")
 
-from src.pretrain import run_pretrain, ddp_worker
+import torch_xla.distributed.xla_multiprocessing as xmp
+
+from src.pretrain import run_pretrain, _mp_fn
 from src.config import PRETRAIN_BATCH_SIZE, PRETRAIN_EPOCHS, PRETRAIN_LR
 
 
@@ -49,9 +49,7 @@ def make_args(resume=None):
         epochs=PRETRAIN_EPOCHS,
         batch_size=PRETRAIN_BATCH_SIZE,
         lr=PRETRAIN_LR,
-        num_workers=2,  # per-rank; 2 ranks * 2 = 4 total = matches Kaggle 4 vCPU
-        amp=True,
-        no_compile=False,
+        num_workers=4,  # per-core; 8 cores * 4 = 32 worker procs
         save_every=10,
         diagnostic_every=10,
         resume=resume,
@@ -60,11 +58,6 @@ def make_args(resume=None):
 
 
 if __name__ == "__main__":
-    world_size = torch.cuda.device_count()
-    print(f"Detected {world_size} GPU(s)")
     args = make_args(resume=RESUME)
-
-    if world_size > 1:
-        mp.spawn(ddp_worker, args=(world_size, args), nprocs=world_size, join=True)
-    else:
-        run_pretrain(args)
+    # nprocs=None auto-detects all available TPU cores (8 on v3-8 / v5e-8).
+    xmp.spawn(_mp_fn, args=(args,), nprocs=None, start_method="fork")

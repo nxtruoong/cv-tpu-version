@@ -169,13 +169,16 @@ def make_loader(
     drop_last: bool = False,
     sampler=None,
     prefetch_factor: int = 2,
+    pin_memory: bool = False,
 ) -> DataLoader:
+    """pin_memory default False — XLA does not benefit from CUDA pinning.
+    Caller (CUDA fine-tune) can opt in via pin_memory=True."""
     kwargs = dict(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle and sampler is None,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=drop_last,
         worker_init_fn=worker_init_fn,
         generator=make_generator(SEED),

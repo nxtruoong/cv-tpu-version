@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
+import torch_xla.core.xla_model as xm
+
 from .augmentation import build_tta_transforms
 from .config import NUM_CLASSES, get_working_dir
 from .data import list_test_images
@@ -31,10 +33,10 @@ def predict_with_tta(
     model: ClassifierModel,
     image_paths: List[str],
     device: torch.device,
-    amp: bool = True,
     batch_size: int = 256,
 ) -> np.ndarray:
-    """Returns (N, 10) softmax probabilities averaged across TTA crops."""
+    """Returns (N, 10) softmax probabilities averaged across TTA crops.
+    Runs on XLA (bf16 native via XLA_USE_BF16)."""
     tta_transforms = build_tta_transforms()
     n = len(image_paths)
     all_probs = np.zeros((n, NUM_CLASSES), dtype=np.float64)
@@ -46,9 +48,9 @@ def predict_with_tta(
                 tf(Image.open(p).convert("RGB")) for p in batch_paths
             ]).to(device, non_blocking=True)
 
-            with torch.amp.autocast("cuda", enabled=amp):
-                logits = model(imgs)
-                probs = F.softmax(logits.float(), dim=1)
+            logits = model(imgs)
+            probs = F.softmax(logits.float(), dim=1)
+            xm.mark_step()
             all_probs[start:start + len(batch_paths)] += probs.cpu().numpy()
 
     all_probs /= len(tta_transforms)
@@ -64,7 +66,6 @@ def ensemble_bundles(
         model = load_bundle(bp, device)
         probs += predict_with_tta(model, image_paths, device)
         del model
-        torch.cuda.empty_cache()
     return probs / len(bundle_paths)
 
 
@@ -82,7 +83,7 @@ def write_submission(
 
 def run_submit(args) -> None:
     set_seed()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = xm.xla_device()
 
     test_paths = list_test_images()
     bundles = args.bundles
