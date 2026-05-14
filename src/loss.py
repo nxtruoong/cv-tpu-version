@@ -1,11 +1,12 @@
-"""NT-Xent loss with XLA-aware all_gather.
+"""NT-Xent loss.
 
-XLA path: xm.all_gather preserves gradients natively across replicas — no need
-to splice the local slot back in (unlike NCCL where all_gather is detached).
+Under SPMD (single-process, multi-chip), the z @ z.t() matmul implicitly
+all-gathers across the sharded batch axis via the XLA compiler — no explicit
+collective needed.
 
-For single-device use, gather is a no-op and this reduces to standard NT-Xent.
+`gather_distributed` flag kept for non-SPMD fallback paths (e.g. CUDA DDP)
+but those paths are unused on the TPU branch.
 """
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,44 +14,28 @@ import torch.nn.functional as F
 from .config import NT_XENT_TEMPERATURE
 
 
-def _xla_world_size() -> int:
-    try:
-        import torch_xla.runtime as xr
-        return xr.world_size()
-    except Exception:
-        return 1
-
-
-def _all_gather_xla(t: torch.Tensor) -> torch.Tensor:
-    """XLA all_gather; preserves grad for local rank."""
-    import torch_xla.core.xla_model as xm
-    return xm.all_gather(t, dim=0)
-
-
 class NTXentLoss(nn.Module):
-    """SimCLR NT-Xent loss with XLA multi-core support.
+    """SimCLR NT-Xent loss. SPMD-compatible (no explicit all_gather).
 
     Args:
         temperature: Softmax temperature τ.
-        gather_distributed: If True, gather z from all replicas before computing
-            loss so anchors see negatives from all cores (true batch).
+        gather_distributed: Legacy flag for non-SPMD multi-process backends.
+            Leave False on TPU SPMD — the compiler handles cross-chip gather
+            inside the similarity matmul.
     """
 
     def __init__(
         self,
         temperature: float = NT_XENT_TEMPERATURE,
-        gather_distributed: bool = True,
+        gather_distributed: bool = False,
     ):
         super().__init__()
         self.temperature = temperature
+        # gather_distributed retained for API stability; ignored under SPMD.
         self.gather_distributed = gather_distributed
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         """z1, z2: L2-normalized projections of shape (B, D)."""
-        if self.gather_distributed and _xla_world_size() > 1:
-            z1 = _all_gather_xla(z1)
-            z2 = _all_gather_xla(z2)
-
         batch = z1.size(0)
         z = torch.cat([z1, z2], dim=0)  # (2B, D)
 

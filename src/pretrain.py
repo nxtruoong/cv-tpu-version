@@ -1,16 +1,19 @@
-"""SimCLR pretraining loop. TPU XLA via xmp.spawn.
+"""SimCLR pretraining loop. TPU SPMD (single-process, all chips auto-sharded).
 
-Run modes:
-- Multi-core TPU: invoked through xmp.spawn(_mp_fn, nprocs=N) in the notebook.
-- Single device fallback (CPU/single XLA): run_pretrain(args) direct.
+v5e-8 on Kaggle exposes 8 chips to a single Python process. SPMD lets us
+write data-parallel training as if single-device — XLA's SPMD compiler
+inserts cross-chip collectives (all_reduce on grads, all_gather inside
+NTXent matmul) automatically based on sharding annotations.
 
-Key XLA notes:
-- bf16 native — no torch.amp, no GradScaler.
-- xm.optimizer_step does cross-replica all_reduce of gradients (replaces DDP).
-- xm.mark_step closes the HLO graph and submits to TPU; without it, the trace
-  grows unboundedly and OOMs.
-- pl.MpDeviceLoader prefetches CPU tensors onto XLA device asynchronously.
-- Avoid .item() inside the step loop — forces graph cut + host sync.
+Key SPMD calls:
+- xr.use_spmd() — enable SPMD mode at startup.
+- xs.Mesh + xs.mark_sharding — declare that input batch dim is sharded
+  across the 'data' mesh axis.
+- pl.MpDeviceLoader(..., input_sharding=...) — applies mark_sharding to
+  every batch as it lands on device.
+
+No xmp.spawn, no DistributedSampler, no xm.optimizer_step — SPMD compiler
+syncs grads via the implicit all-reduce on parameter shardings.
 """
 import argparse
 import json
@@ -18,9 +21,9 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data.distributed import DistributedSampler
 from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm
 
@@ -28,6 +31,7 @@ import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.runtime as xr
+import torch_xla.distributed.spmd as xs
 
 from .augmentation import build_pretrain_transform, ContrastiveViewGenerator, \
     build_pretrain_eval_transform
@@ -51,13 +55,13 @@ def _unwrap(m: nn.Module) -> nn.Module:
     return getattr(m, "_orig_mod", m)
 
 
-def is_main() -> bool:
-    return xr.global_ordinal() == 0
+def _build_mesh():
+    """1-D mesh over all chips, single 'data' axis for batch-dim sharding."""
+    n = xr.global_runtime_device_count()
+    return xs.Mesh(np.arange(n), (n,), ("data",))
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, history, out_dir) -> None:
-    if not is_main():
-        return
     out_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "epoch": epoch,
@@ -67,7 +71,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, history, out_dir) -> Non
         "history": history,
     }
     path = out_dir / f"simclr_resnet18_ep{epoch:03d}.pth"
-    # xm.save moves XLA tensors to CPU before writing; safe for multi-host too.
     xm.save(state, str(path))
     latest = out_dir / "simclr_resnet18_latest.pth"
     xm.save(state, str(latest))
@@ -98,44 +101,41 @@ def build_probe_loaders(batch_size: int, num_workers: int) -> tuple:
 
 def run_pretrain(args) -> None:
     set_seed()
+    xr.use_spmd()
     device = torch_xla.device()
-    world_size = xr.world_size()
-    rank = xr.global_ordinal()
+    mesh = _build_mesh()
+    n_chips = xr.global_runtime_device_count()
+    print(f"SPMD enabled. chips={n_chips}, mesh={mesh.shape()}")
 
     view_gen = ContrastiveViewGenerator(build_pretrain_transform())
     use_cache = (Path(PRETRAIN_CACHE_PATH).exists()
                  and Path(PRETRAIN_CACHE_INDEX).exists())
     if use_cache:
         dataset = MemmapUnlabeledDataset(view_generator=view_gen)
-        if is_main():
-            print(f"Pretrain dataset: {len(dataset)} images "
-                  f"(memmap cache @ {PRETRAIN_CACHE_PATH})")
+        print(f"Pretrain dataset: {len(dataset)} images "
+              f"(memmap cache @ {PRETRAIN_CACHE_PATH})")
     else:
         pretrain_paths = list_train_images()
         test_paths = list_test_images()
         all_paths = pretrain_paths + test_paths
         dataset = UnlabeledImageDataset(all_paths, view_gen)
-        if is_main():
-            print(f"Pretrain dataset: {len(all_paths)} images "
-                  f"({len(pretrain_paths)} train + {len(test_paths)} test) "
-                  f"[JPEG path — slow; run `python -m src.pretrain_cache` first]")
+        print(f"Pretrain dataset: {len(all_paths)} images "
+              f"({len(pretrain_paths)} train + {len(test_paths)} test) "
+              f"[JPEG path — slow; run `python -m src.pretrain_cache` first]")
 
-    per_core_batch = args.batch_size // max(world_size, 1)
-    if world_size > 1:
-        sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank,
-            shuffle=True, seed=24521897, drop_last=True,
-        )
-    else:
-        sampler = None
+    # Global batch sees all 8 chips at once in SPMD; no per-rank slicing.
     loader = make_loader(
-        dataset, batch_size=per_core_batch, shuffle=(sampler is None),
-        num_workers=args.num_workers, drop_last=True, sampler=sampler,
+        dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, drop_last=True,
     )
-    device_loader = pl.MpDeviceLoader(loader, device)
+    # Shard each (B, C, H, W) input along dim 0 across the 'data' axis.
+    input_sharding = xs.ShardingSpec(mesh, (0, 1, 2, 3))
+    device_loader = pl.MpDeviceLoader(loader, device, input_sharding=input_sharding)
 
     model = SimCLRModel(pretrained_backbone=False).to(device)
-    loss_fn = NTXentLoss(gather_distributed=(world_size > 1))
+    # SPMD without gather_distributed: compiler emits all_gather inside the
+    # z @ z.t() matmul automatically when z is sharded on dim 0.
+    loss_fn = NTXentLoss(gather_distributed=False)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=PRETRAIN_WEIGHT_DECAY,
@@ -155,14 +155,11 @@ def run_pretrain(args) -> None:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt["epoch"] + 1
         history = ckpt.get("history", [])
-        if is_main():
-            print(f"Resumed from {args.resume} at epoch {start_epoch}")
+        print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     out_dir = Path(args.output_dir) if args.output_dir else get_working_dir() / "simclr"
 
     for epoch in range(start_epoch, args.epochs):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
         model.train()
         scheduler.step(epoch)
 
@@ -177,7 +174,7 @@ def run_pretrain(args) -> None:
         std_sum = 0.0
         images_seen = 0
         epoch_t0 = time.time()
-        pbar = tqdm(device_loader, disable=not is_main(), desc=f"epoch {epoch}")
+        pbar = tqdm(device_loader, desc=f"epoch {epoch}")
         t_iter = time.time()
         for v1, v2 in pbar:
             t_data = time.time() - t_iter
@@ -189,9 +186,8 @@ def run_pretrain(args) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            # xm.optimizer_step: all_reduce grads across replicas + step.
-            xm.optimizer_step(optimizer)
-            xm.mark_step()  # close HLO graph; submit to TPU
+            optimizer.step()
+            xm.mark_step()
 
             loss_accum = loss_accum + loss.detach()
             n_batches += 1
@@ -208,32 +204,28 @@ def run_pretrain(args) -> None:
                     neg_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
                     neg_t = sim_mat[neg_mask].mean()
                     std_t = torch.cat([z1, z2], dim=0).std(dim=0).mean()
-                # .item() forces a host sync — only do it at low frequency.
                 pos_sum += pos_t.item()
                 neg_sum += neg_t.item()
                 std_sum += std_t.item()
                 diag_count += 1
-                if is_main():
-                    pbar.set_postfix(
-                        loss=(loss_accum / n_batches).item(),
-                        pos=pos_sum / diag_count,
-                        neg=neg_sum / diag_count,
-                        std=std_sum / diag_count,
-                    )
+                pbar.set_postfix(
+                    loss=(loss_accum / n_batches).item(),
+                    pos=pos_sum / diag_count,
+                    neg=neg_sum / diag_count,
+                    std=std_sum / diag_count,
+                )
             t_iter = time.time()
 
-        # Flush any pending ops before measuring epoch time.
         xm.mark_step()
         epoch_sec = time.time() - epoch_t0
         throughput = images_seen / max(epoch_sec, 1e-6)
         current_lr = optimizer.param_groups[0]["lr"]
 
-        if is_main():
-            print(f"[ep {epoch}] avg data={t_data_sum/max(n_batches,1):.3f}s "
-                  f"compute={t_compute_sum/max(n_batches,1):.3f}s "
-                  f"-> {'IO-bound' if t_data_sum > t_compute_sum else 'compute-bound'} "
-                  f"| {throughput:.0f} img/s | {epoch_sec/60:.1f} min "
-                  f"| lr={current_lr:.2e}")
+        print(f"[ep {epoch}] avg data={t_data_sum/max(n_batches,1):.3f}s "
+              f"compute={t_compute_sum/max(n_batches,1):.3f}s "
+              f"-> {'IO-bound' if t_data_sum > t_compute_sum else 'compute-bound'} "
+              f"| {throughput:.0f} img/s | {epoch_sec/60:.1f} min "
+              f"| lr={current_lr:.2e}")
 
         epoch_loss = (loss_accum / max(n_batches, 1)).item()
         log_entry = {
@@ -249,8 +241,7 @@ def run_pretrain(args) -> None:
             "t_compute_avg": t_compute_sum / max(n_batches, 1),
         }
 
-        run_diag = (epoch + 1) % args.diagnostic_every == 0
-        if run_diag and is_main():
+        if (epoch + 1) % args.diagnostic_every == 0:
             base = _unwrap(model)
             base.eval()
             au = sample_alignment_uniformity(base, loader, device, max_batches=3)
@@ -269,19 +260,8 @@ def run_pretrain(args) -> None:
 
         if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
             save_checkpoint(model, optimizer, scheduler, epoch, history, out_dir)
-            if is_main():
-                with open(out_dir / "history.json", "w") as f:
-                    json.dump(history, f, indent=2)
-
-        # Sync replicas after rank0-only diagnostics/save before next epoch's
-        # collective ops (NTXent all_gather) — keeps replicas in lock-step.
-        if world_size > 1:
-            xm.rendezvous("epoch_end")
-
-
-def _mp_fn(index, args):
-    """xmp.spawn entrypoint. `index` is the local core id."""
-    run_pretrain(args)
+            with open(out_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -289,7 +269,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
     p.add_argument("--batch-size", type=int, default=PRETRAIN_BATCH_SIZE)
     p.add_argument("--lr", type=float, default=PRETRAIN_LR)
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--diagnostic-every", type=int, default=10)
     p.add_argument("--resume", type=str, default=None)
