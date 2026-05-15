@@ -128,8 +128,10 @@ def run_pretrain(args) -> None:
         dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True,
     )
-    # Shard each (B, C, H, W) input along dim 0 across the 'data' axis.
-    input_sharding = xs.ShardingSpec(mesh, (0, 1, 2, 3))
+    # Shard each (B, C, H, W) input along dim 0 across the 'data' mesh axis.
+    # partition_spec values are mesh axis names (or None for replicated),
+    # ordered by tensor dim.
+    input_sharding = xs.ShardingSpec(mesh, ("data", None, None, None))
     device_loader = pl.MpDeviceLoader(loader, device, input_sharding=input_sharding)
 
     model = SimCLRModel(pretrained_backbone=False).to(device)
