@@ -24,6 +24,8 @@ os.environ["PYTHONPATH"] = REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH",
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
 os.environ.setdefault("XLA_USE_BF16", "1")
+# If XLA fails to compile all_gather with pin_layout=True, set to "0":
+# os.environ["XLA_ALL_GATHER_PIN_LAYOUT"] = "0"
 
 from src.pretrain import run_pretrain
 from src.config import PRETRAIN_BATCH_SIZE, PRETRAIN_EPOCHS, PRETRAIN_LR

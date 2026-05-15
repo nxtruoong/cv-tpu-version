@@ -22,6 +22,14 @@ def _mark_step():
         pass
 
 
+def _optimizer_step(optim: torch.optim.Optimizer) -> None:
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.optimizer_step(optim, barrier=True)
+    except Exception:
+        optim.step()
+
+
 @torch.no_grad()
 def extract_features(
     backbone: nn.Module, loader: DataLoader, device: torch.device
@@ -73,7 +81,7 @@ def linear_probe(
             loss = loss_fn(logits, train_labels[idx])
             optim.zero_grad()
             loss.backward()
-            optim.step()
+            _optimizer_step(optim)
         _mark_step()
 
     head.eval()

@@ -27,7 +27,8 @@ class ProjectionHead(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            # inplace=False: safer with XLA + bf16 autograd than inplace ReLU.
+            nn.ReLU(inplace=False),
             nn.Linear(hidden_dim, out_dim),
         )
 

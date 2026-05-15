@@ -1,19 +1,18 @@
-"""SimCLR pretraining loop. TPU SPMD (single-process, all chips auto-sharded).
+"""SimCLR pretraining loop. TPU SPMD (single-process, batch sharded across chips).
 
-v5e-8 on Kaggle exposes 8 chips to a single Python process. SPMD lets us
-write data-parallel training as if single-device — XLA's SPMD compiler
-inserts cross-chip collectives (all_reduce on grads, all_gather inside
-NTXent matmul) automatically based on sharding annotations.
+v5e-8 on Kaggle exposes 8 chips in one process. Inputs are sharded on the
+batch axis via ``MpDeviceLoader`` + ``ShardingSpec``. NT-Xent must see the
+**global** batch of negatives; we enable ``NTXentLoss(gather_distributed=True)``
+so embeddings are ``xm.all_gather``'d on dim 0 before the similarity matrix
+(inference-only compiler matmul on sharded tensors is unreliable on PJRT/v5e).
 
 Key SPMD calls:
 - xr.use_spmd() — enable SPMD mode at startup.
-- xs.Mesh + xs.mark_sharding — declare that input batch dim is sharded
-  across the 'data' mesh axis.
-- pl.MpDeviceLoader(..., input_sharding=...) — applies mark_sharding to
-  every batch as it lands on device.
+- xs.Mesh + ShardingSpec — batch dim sharded on the ``data`` mesh axis.
+- pl.MpDeviceLoader(..., input_sharding=...) — shard each host batch on H2D.
 
-No xmp.spawn, no DistributedSampler, no xm.optimizer_step — SPMD compiler
-syncs grads via the implicit all-reduce on parameter shardings.
+No xmp.spawn, no DistributedSampler. Optimizer uses ``optimizer.step()`` +
+``xm.mark_step()`` like the upstream XLA ResNet SPMD data-parallel example.
 """
 import argparse
 import json
@@ -46,7 +45,7 @@ from .data import (
     build_group_kfold, make_loader,
 )
 from .diagnostics import linear_probe, sample_alignment_uniformity
-from .loss import NTXentLoss
+from .loss import NTXentLoss, _xla_all_gather_cat_dim0
 from .model import SimCLRModel
 from .seed_utils import set_seed
 
@@ -135,9 +134,8 @@ def run_pretrain(args) -> None:
     device_loader = pl.MpDeviceLoader(loader, device, input_sharding=input_sharding)
 
     model = SimCLRModel(pretrained_backbone=False).to(device)
-    # SPMD without gather_distributed: compiler emits all_gather inside the
-    # z @ z.t() matmul automatically when z is sharded on dim 0.
-    loss_fn = NTXentLoss(gather_distributed=False)
+    # Explicit all_gather inside loss (do not rely on matmul to insert it).
+    loss_fn = NTXentLoss(gather_distributed=True)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=PRETRAIN_WEIGHT_DECAY,
@@ -200,12 +198,17 @@ def run_pretrain(args) -> None:
 
             if n_batches % DIAG_EVERY == 0:
                 with torch.no_grad():
-                    pos_t = (z1 * z2).sum(dim=1).mean()
-                    B = z1.size(0)
-                    sim_mat = z1 @ z2.t()
+                    if loss_fn.gather_distributed:
+                        dz1 = _xla_all_gather_cat_dim0(z1.detach())
+                        dz2 = _xla_all_gather_cat_dim0(z2.detach())
+                    else:
+                        dz1, dz2 = z1, z2
+                    pos_t = (dz1 * dz2).sum(dim=1).mean()
+                    B = dz1.size(0)
+                    sim_mat = dz1 @ dz2.t()
                     neg_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
                     neg_t = sim_mat[neg_mask].mean()
-                    std_t = torch.cat([z1, z2], dim=0).std(dim=0).mean()
+                    std_t = torch.cat([dz1, dz2], dim=0).std(dim=0).mean()
                 pos_sum += pos_t.item()
                 neg_sum += neg_t.item()
                 std_sum += std_t.item()

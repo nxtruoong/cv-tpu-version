@@ -1,12 +1,17 @@
 """NT-Xent loss.
 
-Under SPMD (single-process, multi-chip), the z @ z.t() matmul implicitly
-all-gathers across the sharded batch axis via the XLA compiler — no explicit
-collective needed.
+On TPU SPMD with batch-sharded inputs, each chip only holds a local shard of
+`z1`/`z2`. Relying on the XLA compiler to infer a global `z @ z.t()` from
+sharded activations is fragile across PJRT / v5e stacks and can yield wrong
+contrastive logits (collapse, flat diagnostics, or layout-related corruption).
 
-`gather_distributed` flag kept for non-SPMD fallback paths (e.g. CUDA DDP)
-but those paths are unused on the TPU branch.
+When ``gather_distributed=True``, we explicitly ``xm.all_gather`` on dim 0 so
+NT-Xent always matches the global batch (same semantics as multi-GPU SimCLR).
+Set env ``XLA_ALL_GATHER_PIN_LAYOUT=0`` if you hit XLA layout compile errors
+(pin_layout can trade compile fragility vs. stricter layout matching).
 """
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,14 +19,24 @@ import torch.nn.functional as F
 from .config import NT_XENT_TEMPERATURE
 
 
+def _xla_all_gather_cat_dim0(t: torch.Tensor) -> torch.Tensor:
+    if t.device.type != "xla":
+        return t
+    import torch_xla.core.xla_model as xm
+
+    pin_layout = os.environ.get("XLA_ALL_GATHER_PIN_LAYOUT", "1") != "0"
+    return xm.all_gather(t, dim=0, pin_layout=pin_layout)
+
+
 class NTXentLoss(nn.Module):
-    """SimCLR NT-Xent loss. SPMD-compatible (no explicit all_gather).
+    """SimCLR NT-Xent loss.
 
     Args:
         temperature: Softmax temperature τ.
-        gather_distributed: Legacy flag for non-SPMD multi-process backends.
-            Leave False on TPU SPMD — the compiler handles cross-chip gather
-            inside the similarity matmul.
+        gather_distributed: If True (recommended for TPU SPMD data-parallel),
+            all-gather normalized projections on the batch axis before building
+            the (2B, 2B) similarity matrix. If False, loss uses only the local
+            shard (wrong global batch size under input sharding).
     """
 
     def __init__(
@@ -31,11 +46,14 @@ class NTXentLoss(nn.Module):
     ):
         super().__init__()
         self.temperature = temperature
-        # gather_distributed retained for API stability; ignored under SPMD.
         self.gather_distributed = gather_distributed
 
     def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-        """z1, z2: L2-normalized projections of shape (B, D)."""
+        """z1, z2: L2-normalized projections of shape (B_local, D) or (B, D)."""
+        if self.gather_distributed:
+            z1 = _xla_all_gather_cat_dim0(z1)
+            z2 = _xla_all_gather_cat_dim0(z2)
+
         batch = z1.size(0)
         z = torch.cat([z1, z2], dim=0)  # (2B, D)
 
